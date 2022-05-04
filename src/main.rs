@@ -71,7 +71,7 @@ mod tests {
             [false, true, false, false, false, false, true, false],
             [false, false, true, false, false, true, false, false],
             [false, false, false, true, true, false, false, false],
-            [false, false, false, true, false, false, false, false],
+            [true, false, false, true, false, false, false, true],
             [false, false, true, false, false, false, false, false],
             [false, true, false, true, false, false, false, false],
         ];
@@ -88,6 +88,15 @@ mod tests {
         #[test]
         fn rgb() -> Result<()> {
             let img_path = Path::new("test_data/not_gray.png");
+            let correct = ndarray::arr2(GOOD_IMG);
+            let loaded = load_image(img_path)?;
+            assert_eq!(correct, loaded);
+            Ok(())
+        }
+
+        #[test]
+        fn not_8_bit() -> Result<()> {
+            let img_path = Path::new("test_data/not_gray_16.png");
             let correct = ndarray::arr2(GOOD_IMG);
             let loaded = load_image(img_path)?;
             assert_eq!(correct, loaded);
