@@ -21,16 +21,16 @@ fn validate_image_path(img_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_image(img_path: &Path) -> Result<Array2<u8>> {
+fn load_image(img_path: &Path) -> Result<Array2<bool>> {
     let img_base = image::open(img_path)?.to_luma8();
     let img_vec = img_base.as_raw();
     let img_width = img_base.width() as usize;
     let img_height = img_base.height() as usize;
-    let mut actual_image = Array2::zeros((img_height, img_width));
+    let mut actual_image = Array2::<u8>::zeros((img_height, img_width)).mapv(|a| a == u8::MAX);
     for row_idx in 0..img_height {
         for col_idx in 0..img_width {
             let actual_position = row_idx * (img_height + 1) + col_idx;
-            actual_image[[row_idx, col_idx]] = img_vec.get(actual_position).unwrap().clone();
+            actual_image[[row_idx, col_idx]] = *img_vec.get(actual_position).unwrap() == u8::MAX;
         }
     }
     Ok(actual_image)
@@ -66,14 +66,14 @@ mod tests {
     mod test_load_image {
         use super::super::*;
 
-        const GOOD_IMG: &[[u8; 8]; 7] = &[
-            [255, 0, 0, 0, 0, 0, 0, 255],
-            [0, 255, 0, 0, 0, 0, 255, 0],
-            [0, 0, 255, 0, 0, 255, 0, 0],
-            [0, 0, 0, 255, 255, 0, 0, 0],
-            [0, 0, 0, 255, 0, 0, 0, 0],
-            [0, 0, 255, 0, 0, 0, 0, 0],
-            [0, 255, 0, 255, 0, 0, 0, 0],
+        const GOOD_IMG: &[[bool; 8]; 7] = &[
+            [true, false, false, false, false, false, false, true],
+            [false, true, false, false, false, false, true, false],
+            [false, false, true, false, false, true, false, false],
+            [false, false, false, true, true, false, false, false],
+            [false, false, false, true, false, false, false, false],
+            [false, false, true, false, false, false, false, false],
+            [false, true, false, true, false, false, false, false],
         ];
 
         #[test]
