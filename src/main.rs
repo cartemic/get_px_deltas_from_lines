@@ -26,14 +26,10 @@ fn load_image(img_path: &Path) -> Result<Array2<bool>> {
     let img_vec = img_base.as_raw();
     let img_width = img_base.width() as usize;
     let img_height = img_base.height() as usize;
-    let mut actual_image = Array2::<u8>::zeros((img_height, img_width)).mapv(|a| a == u8::MAX);
-    for row_idx in 0..img_height {
-        for col_idx in 0..img_width {
-            let actual_position = row_idx * (img_height + 1) + col_idx;
-            actual_image[[row_idx, col_idx]] = *img_vec.get(actual_position).unwrap() == u8::MAX;
-        }
-    }
-    Ok(actual_image)
+    let image = Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?
+        .mapv(|a| a == u8::MAX);
+
+    Ok(image)
 }
 
 #[cfg(test)]
