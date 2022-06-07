@@ -1,4 +1,4 @@
-use ndarray::Array2;
+use ndarray::{Array2, Axis, Slice};
 use std::path::Path;
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -29,7 +29,94 @@ fn load_image(img_path: &Path) -> Result<Array2<bool>> {
     let image = Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?
         .mapv(|a| a == u8::MAX);
 
+    // todo: this doesn't go here; this stuff all needs its own tests
+    get_all_diffs(image.clone(), image.clone())?;
+
     Ok(image)
+}
+
+/// find indices where vec is True
+fn find_true_indices(vec: &[&bool]) -> Vec<usize> {
+    vec.iter()
+        .enumerate()
+        .filter(|(_, &val)| *val)
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>()
+}
+
+fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> {
+    if image.shape() != mask.shape() {
+        let msg = format!(
+            "Shape mismatch: img={:?}, mask={:?}",
+            image.shape(),
+            mask.shape()
+        );
+        return Err(Error::from(msg));
+    }
+
+    let axis = Axis(0);
+    let mut diffs = Vec::new();
+    let img_height = image.shape()[0] as isize;
+    for row in 0..img_height {
+        // take the whole row
+        let indices = Slice::new(row, Some(row + 1), 1);
+        let row = image
+            .slice_axis(axis, indices)
+            .into_iter()
+            .collect::<Vec<&bool>>();
+        let mut row_diffs = get_diffs_from_row(row.clone(), row)?;
+        diffs.append(&mut row_diffs);
+    }
+
+    Ok(diffs)
+}
+
+fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize>> {
+    // find indices to split row into sub-rows
+    let mut mask_split_indices = find_true_indices(row_mask.as_slice());
+
+    // make sure we go to the end of the image
+    mask_split_indices.push(row.len());
+
+    // identify and measure sub-rows
+    let mut idx_start = 0;
+    let mut row_diffs: Vec<usize> = Vec::new();
+    for idx_end in mask_split_indices {
+        // avoid negative usize overflow panic and skip adjacent pixels
+        if (idx_end == 0) || !row_mask[idx_end - 1].to_owned() {
+            let split = &row.as_slice()[idx_start..idx_end];
+
+            // todo: real stuff here pls -- inverting the mask is bogus as hell and only done for testing
+            let mut test_input_dont_use = Vec::new();
+            for _ in split {
+                test_input_dont_use.push(&true)
+            }
+            let mut sub_diffs = get_sub_diffs_from_row(&test_input_dont_use)?;
+            row_diffs.append(&mut sub_diffs);
+        }
+        // increment regardless of whether or not the current pixel was usable so we don't
+        // accidentally keep masked pixels in the event of adjacent mask indices
+        idx_start = idx_end + 1;
+    }
+    Ok(row_diffs)
+}
+
+fn get_sub_diffs_from_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
+    let edges = find_true_indices(sub_row);
+    let mut diffs = Vec::new();
+    let mut last_edge_idx = 0;
+    for idx in edges {
+        if diffs.len() > 0 {
+            let diff = idx - last_edge_idx;
+            if diff > 1 {
+                diffs.push(diff);
+            }
+        }
+        // don't use adjacent edge pixels
+        last_edge_idx = idx;
+    }
+
+    Ok(diffs)
 }
 
 #[cfg(test)]
