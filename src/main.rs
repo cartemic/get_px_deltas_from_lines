@@ -29,13 +29,9 @@ fn load_image(img_path: &Path) -> Result<Array2<bool>> {
     let image = Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?
         .mapv(|a| a == u8::MAX);
 
-    // todo: this doesn't go here; this stuff all needs its own tests
-    get_all_diffs(image.clone(), image.clone())?;
-
     Ok(image)
 }
 
-/// find indices where vec is True
 fn find_true_indices(vec: &[&bool]) -> Vec<usize> {
     vec.iter()
         .enumerate()
@@ -44,6 +40,32 @@ fn find_true_indices(vec: &[&bool]) -> Vec<usize> {
         .collect::<Vec<_>>()
 }
 
+/// the main one todo: wrap
+pub fn get_px_deltas_from_lines(
+    image_path: String,
+    mask_path: Option<String>,
+) -> Result<Vec<usize>> {
+    let image_path = Path::new(&image_path);
+    validate_image_path(image_path)?;
+    let image = load_image(image_path)?;
+
+    let mask = match mask_path {
+        Some(pth) => {
+            let mask_path = Path::new(&pth);
+            validate_image_path(mask_path)?;
+            load_image(image_path)?
+        }
+        // no mask
+        None => image.clone().mapv(|_| false),
+    };
+
+    let result = get_all_diffs(image, mask)?;
+
+    Ok(result)
+}
+
+/// Gets all distances between cell edges within a single image. A mask is required, but may be
+/// all false (i.e. no masking).
 fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> {
     if image.shape() != mask.shape() {
         let msg = format!(
@@ -64,13 +86,18 @@ fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> 
             .slice_axis(axis, indices)
             .into_iter()
             .collect::<Vec<&bool>>();
-        let mut row_diffs = get_diffs_from_row(row.clone(), row)?;
+        let row_mask = mask
+            .slice_axis(axis, indices)
+            .into_iter()
+            .collect::<Vec<&bool>>();
+        let mut row_diffs = get_diffs_from_row(row, row_mask)?;
         diffs.append(&mut row_diffs);
     }
 
     Ok(diffs)
 }
 
+/// Get all pixel distances between cell boundaries for a single row in an image
 fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize>> {
     // find indices to split row into sub-rows
     let mut mask_split_indices = find_true_indices(row_mask.as_slice());
@@ -85,13 +112,7 @@ fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize
         // avoid negative usize overflow panic and skip adjacent pixels
         if (idx_end == 0) || !row_mask[idx_end - 1].to_owned() {
             let split = &row.as_slice()[idx_start..idx_end];
-
-            // todo: real stuff here pls -- inverting the mask is bogus as hell and only done for testing
-            let mut test_input_dont_use = Vec::new();
-            for _ in split {
-                test_input_dont_use.push(&true)
-            }
-            let mut sub_diffs = get_sub_diffs_from_row(&test_input_dont_use)?;
+            let mut sub_diffs = get_diffs_from_sub_row(split)?;
             row_diffs.append(&mut sub_diffs);
         }
         // increment regardless of whether or not the current pixel was usable so we don't
@@ -101,12 +122,17 @@ fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize
     Ok(row_diffs)
 }
 
-fn get_sub_diffs_from_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
+/// The actual diff-getter. Operates on a masked subsection of a single row. If two measurements
+/// are in adjacent pixels, this method selects the leftmost and rightmost adjacent locations and
+/// throws out the others (i.e. it only accepts measurements where the boundary location is >1 px
+/// away from the previous boundary location). The distance between the leftmost and rightmost
+/// adjacent locations is not counted.
+fn get_diffs_from_sub_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
     let edges = find_true_indices(sub_row);
     let mut diffs = Vec::new();
     let mut last_edge_idx = 0;
     for idx in edges {
-        if diffs.len() > 0 {
+        if idx != last_edge_idx {
             let diff = idx - last_edge_idx;
             if diff > 1 {
                 diffs.push(diff);
@@ -121,6 +147,7 @@ fn get_sub_diffs_from_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     mod test_validate_image_path {
         use super::super::*;
 
@@ -184,6 +211,74 @@ mod tests {
             let loaded = load_image(img_path)?;
             assert_eq!(correct, loaded);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn test_get_diffs_from_sub_row() -> Result<()> {
+        let sub_row = &[
+            &true, &false, &false, &true, &false, &true, &true, &true, &false, &true,
+        ];
+        let good: [usize; 3] = [3, 2, 2];
+        let result = get_diffs_from_sub_row(sub_row)?;
+        assert_eq!(result, good);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_diffs_from_row() -> Result<()> {
+        let row = vec![
+            &true, &false, &false, &true, &true, &true, &false, &true, &false, &true, &true, &false,
+        ];
+        let row_mask = vec![
+            &false, &false, &false, &false, &true, &false, &false, &false, &true, &false, &false,
+            &true,
+        ];
+        let good: [usize; 2] = [3, 2];
+        let result = get_diffs_from_row(row, row_mask)?;
+        assert_eq!(result, good);
+
+        Ok(())
+    }
+
+    mod test_get_all_diffs {
+        use super::super::*;
+
+        #[test]
+        fn test_good_value() -> Result<()> {
+            let img_height = 2;
+            let img_width = 8;
+            let image = Vec::from([
+                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+            ])
+            .concat();
+            let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
+            let mask = Vec::from([
+                [false, false, false, false, false, false, false, false], // keep gaps
+                [false, true, false, false, false, false, false, true], // new gaps: 3 only (2s masked)
+            ])
+            .concat();
+            let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
+            let good = [2, 3, 2, 3];
+            let result = get_all_diffs(image, mask)?;
+            assert_eq!(result, good);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_shape_mismatch() {
+            let image = Array2::zeros((1, 4)).mapv(|a: i8| a != 0);
+            let mask = Array2::zeros((4, 59)).mapv(|a: i8| a != 0);
+            let result = get_all_diffs(image, mask);
+            assert!(result.is_err());
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Shape mismatch: img="));
         }
     }
 }
