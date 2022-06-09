@@ -26,8 +26,8 @@ fn load_image(img_path: &Path) -> Result<Array2<bool>> {
     let img_vec = img_base.as_raw();
     let img_width = img_base.width() as usize;
     let img_height = img_base.height() as usize;
-    let image = Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?
-        .mapv(|a| a == u8::MAX);
+    let image =
+        Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?.mapv(|a| a > 0);
 
     Ok(image)
 }
@@ -53,7 +53,7 @@ pub fn get_px_deltas_from_lines(
         Some(pth) => {
             let mask_path = Path::new(&pth);
             validate_image_path(mask_path)?;
-            load_image(image_path)?
+            load_image(mask_path)?
         }
         // no mask
         None => image.clone().mapv(|_| false),
@@ -82,7 +82,7 @@ fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> 
     for row in 0..img_height {
         // take the whole row
         let indices = Slice::new(row, Some(row + 1), 1);
-        let row = image
+        let row_img = image
             .slice_axis(axis, indices)
             .into_iter()
             .collect::<Vec<&bool>>();
@@ -90,7 +90,7 @@ fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> 
             .slice_axis(axis, indices)
             .into_iter()
             .collect::<Vec<&bool>>();
-        let mut row_diffs = get_diffs_from_row(row, row_mask)?;
+        let mut row_diffs = get_diffs_from_row(row_img, row_mask)?;
         diffs.append(&mut row_diffs);
     }
 
@@ -131,15 +131,16 @@ fn get_diffs_from_sub_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
     let edges = find_true_indices(sub_row);
     let mut diffs = Vec::new();
     let mut last_edge_idx = 0;
-    for idx in edges {
-        if idx != last_edge_idx {
+    for (idx_no, idx) in edges.iter().enumerate() {
+        // keep the first found edge from measuring a difference from the left edge of the image
+        if (idx_no > 0) & (*idx != last_edge_idx) {
             let diff = idx - last_edge_idx;
             if diff > 1 {
                 diffs.push(diff);
             }
         }
         // don't use adjacent edge pixels
-        last_edge_idx = idx;
+        last_edge_idx = *idx;
     }
 
     Ok(diffs)
@@ -246,7 +247,32 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn test_good_value() -> Result<()> {
+        fn test_good_value_with_mask() -> Result<()> {
+            let img_height = 3;
+            let img_width = 8;
+            let image = Vec::from([
+                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+            ])
+            .concat();
+            let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
+            let mask = Vec::from([
+                [false, false, false, false, false, false, false, false], // keep gaps
+                [false, true, false, false, false, false, false, true], // new gaps: 3 only (2s masked)
+                [false, true, true, true, true, false, false, false],   // new gaps: 1
+            ])
+            .concat();
+            let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
+            let good = [2, 3, 2, 3, 2];
+            let result = get_all_diffs(image, mask)?;
+            assert_eq!(result, good);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_good_value_without_mask() -> Result<()> {
             let img_height = 2;
             let img_width = 8;
             let image = Vec::from([
@@ -257,11 +283,33 @@ mod tests {
             let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
             let mask = Vec::from([
                 [false, false, false, false, false, false, false, false], // keep gaps
-                [false, true, false, false, false, false, false, true], // new gaps: 3 only (2s masked)
+                [false, false, false, false, false, false, false, false], // new gaps: 3 only (2s masked)
             ])
             .concat();
             let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
-            let good = [2, 3, 2, 3];
+            let good = [2, 3, 2, 2, 3, 2];
+            let result = get_all_diffs(image, mask)?;
+            assert_eq!(result, good);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_wtf() -> Result<()> {
+            // todo: incorporate into other tests
+            let img_height = 1;
+            let img_width = 8;
+            let image = Vec::from([
+                [false, false, true, false, false, true, false, false], // gaps: 2, 3, 2
+            ])
+            .concat();
+            let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
+            let mask = Vec::from([
+                [false, false, false, false, false, false, false, false], // keep gaps
+            ])
+            .concat();
+            let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
+            let good = [3];
             let result = get_all_diffs(image, mask)?;
             assert_eq!(result, good);
 
