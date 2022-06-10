@@ -4,8 +4,28 @@ use std::path::Path;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-fn main() {
-    println!("Hello, world!");
+/// the main function
+pub fn get_px_deltas_from_lines(
+    image_path: String,
+    mask_path: Option<String>,
+) -> Result<Vec<usize>> {
+    let image_path = Path::new(&image_path);
+    validate_image_path(image_path)?;
+    let image = load_image(image_path)?;
+
+    let mask = match mask_path {
+        Some(pth) => {
+            let mask_path = Path::new(&pth);
+            validate_image_path(mask_path)?;
+            load_image(mask_path)?
+        }
+        // no mask
+        None => image.clone().mapv(|_| false),
+    };
+
+    let result = get_all_diffs(image, mask)?;
+
+    Ok(result)
 }
 
 fn validate_image_path(img_path: &Path) -> Result<()> {
@@ -38,30 +58,6 @@ fn find_true_indices(vec: &[&bool]) -> Vec<usize> {
         .filter(|(_, &val)| *val)
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>()
-}
-
-/// the main one todo: wrap
-pub fn get_px_deltas_from_lines(
-    image_path: String,
-    mask_path: Option<String>,
-) -> Result<Vec<usize>> {
-    let image_path = Path::new(&image_path);
-    validate_image_path(image_path)?;
-    let image = load_image(image_path)?;
-
-    let mask = match mask_path {
-        Some(pth) => {
-            let mask_path = Path::new(&pth);
-            validate_image_path(mask_path)?;
-            load_image(mask_path)?
-        }
-        // no mask
-        None => image.clone().mapv(|_| false),
-    };
-
-    let result = get_all_diffs(image, mask)?;
-
-    Ok(result)
 }
 
 /// Gets all distances between cell edges within a single image. A mask is required, but may be
