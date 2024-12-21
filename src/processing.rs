@@ -1,14 +1,14 @@
 use ndarray::{Array2, Axis, Slice};
+use num_traits::Bounded;
+use pyo3::exceptions::{PyFileExistsError, PyRuntimeError, PyValueError};
+use pyo3::PyResult;
 use std::path::Path;
-
-type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// the main function
 pub fn get_px_deltas_from_lines(
     image_path: String,
     mask_path: Option<String>,
-) -> Result<Vec<usize>> {
+) -> PyResult<Vec<usize>> {
     let image_path = Path::new(&image_path);
     validate_image_path(image_path)?;
     let image = load_image(image_path)?;
@@ -20,56 +20,64 @@ pub fn get_px_deltas_from_lines(
             load_image(mask_path)?
         }
         // no mask
-        None => image.clone().mapv(|_| false),
+        None => image.clone().mapv(|_| 0),
     };
 
-    let result = get_all_diffs(image, mask)?;
+    let result = all_pixel_deltas(image, mask)?;
 
     Ok(result)
 }
 
-fn validate_image_path(img_path: &Path) -> Result<()> {
+fn validate_image_path(img_path: &Path) -> PyResult<()> {
     let img_path_str = img_path.display().to_string();
     if !img_path_str.ends_with(".png") {
-        return Err(Error::from(format!("Non-PNG input: {img_path_str}")));
+        return Err(PyValueError::new_err(format!(
+            "Non-PNG input: {img_path_str}"
+        )));
     }
     if !img_path.exists() {
-        return Err(Error::from(format!(
+        return Err(PyFileExistsError::new_err(format!(
             "Image path does not exist: {img_path_str}"
         )));
     }
     Ok(())
 }
 
-fn load_image(img_path: &Path) -> Result<Array2<bool>> {
-    let img_base = image::open(img_path)?.to_luma8();
+fn load_image(img_path: &Path) -> PyResult<Array2<u8>> {
+    let img_base = image::open(img_path)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        .to_luma8();
     let img_vec = img_base.as_raw();
     let img_width = img_base.width() as usize;
     let img_height = img_base.height() as usize;
-    let image =
-        Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())?.mapv(|a| a > 0);
 
-    Ok(image)
+    Array2::<u8>::from_shape_vec((img_height, img_width), img_vec.to_owned())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-fn find_true_indices(vec: &[&bool]) -> Vec<usize> {
+/// Find indices of an intensity map where the value is maximum, i.e. the pixel is white.
+fn white_pixel_indices<T: Bounded + PartialEq>(vec: &[&T]) -> Vec<usize> {
+    let white = T::max_value();
     vec.iter()
         .enumerate()
-        .filter(|(_, &val)| *val)
+        .filter(|(_, &val)| *val == white)
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>()
 }
 
 /// Gets all distances between cell edges within a single image. A mask is required, but may be
 /// all false (i.e. no masking).
-fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> {
+fn all_pixel_deltas<T: Bounded + PartialEq>(
+    image: Array2<T>,
+    mask: Array2<T>,
+) -> PyResult<Vec<usize>> {
     if image.shape() != mask.shape() {
         let msg = format!(
             "Shape mismatch: img={:?}, mask={:?}",
             image.shape(),
             mask.shape()
         );
-        return Err(Error::from(msg));
+        return Err(PyValueError::new_err(msg));
     }
 
     let axis = Axis(0);
@@ -81,12 +89,12 @@ fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> 
         let row_img = image
             .slice_axis(axis, indices)
             .into_iter()
-            .collect::<Vec<&bool>>();
+            .collect::<Vec<&T>>();
         let row_mask = mask
             .slice_axis(axis, indices)
             .into_iter()
-            .collect::<Vec<&bool>>();
-        let mut row_diffs = get_diffs_from_row(row_img, row_mask)?;
+            .collect::<Vec<&T>>();
+        let mut row_diffs = pixel_deltas_from_row(row_img, row_mask);
         diffs.append(&mut row_diffs);
     }
 
@@ -94,9 +102,11 @@ fn get_all_diffs(image: Array2<bool>, mask: Array2<bool>) -> Result<Vec<usize>> 
 }
 
 /// Get all pixel distances between cell boundaries for a single row in an image
-fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize>> {
+fn pixel_deltas_from_row<T: Bounded + PartialEq>(row: Vec<&T>, row_mask: Vec<&T>) -> Vec<usize> {
+    let white = T::max_value();
+
     // find indices to split row into sub-rows
-    let mut mask_split_indices = find_true_indices(row_mask.as_slice());
+    let mut mask_split_indices = white_pixel_indices(row_mask.as_slice());
 
     // make sure we go to the end of the image
     mask_split_indices.push(row.len());
@@ -106,16 +116,16 @@ fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize
     let mut row_diffs: Vec<usize> = Vec::new();
     for idx_end in mask_split_indices {
         // avoid negative usize overflow panic and skip adjacent pixels
-        if (idx_end == 0) || !row_mask[idx_end - 1].to_owned() {
+        if (idx_end == 0) || !(*row_mask[idx_end - 1] == white) {
             let split = &row.as_slice()[idx_start..idx_end];
-            let mut sub_diffs = get_diffs_from_sub_row(split)?;
+            let mut sub_diffs = pixel_deltas_from_masked_run(split);
             row_diffs.append(&mut sub_diffs);
         }
-        // increment regardless of whether or not the current pixel was usable so we don't
+        // increment regardless of whether the current pixel was usable so we don't
         // accidentally keep masked pixels in the event of adjacent mask indices
         idx_start = idx_end + 1;
     }
-    Ok(row_diffs)
+    row_diffs
 }
 
 /// The actual diff-getter. Operates on a masked subsection of a single row. If two measurements
@@ -123,8 +133,8 @@ fn get_diffs_from_row(row: Vec<&bool>, row_mask: Vec<&bool>) -> Result<Vec<usize
 /// throws out the others (i.e. it only accepts measurements where the boundary location is >1 px
 /// away from the previous boundary location). The distance between the leftmost and rightmost
 /// adjacent locations is not counted.
-fn get_diffs_from_sub_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
-    let edges = find_true_indices(sub_row);
+fn pixel_deltas_from_masked_run<T: Bounded + PartialEq>(sub_row: &[&T]) -> Vec<usize> {
+    let edges = white_pixel_indices(sub_row);
     let mut diffs = Vec::new();
     let mut last_edge_idx = 0;
     for (idx_no, idx) in edges.iter().enumerate() {
@@ -139,7 +149,7 @@ fn get_diffs_from_sub_row(sub_row: &[&bool]) -> Result<Vec<usize>> {
         last_edge_idx = *idx;
     }
 
-    Ok(diffs)
+    diffs
 }
 
 #[cfg(test)]
@@ -173,132 +183,325 @@ mod tests {
     mod test_load_image {
         use super::super::*;
 
-        const GOOD_IMG: &[[bool; 8]; 7] = &[
-            [true, false, false, false, false, false, false, true],
-            [false, true, false, false, false, false, true, false],
-            [false, false, true, false, false, true, false, false],
-            [false, false, false, true, true, false, false, false],
-            [true, false, false, true, false, false, false, true],
-            [false, false, true, false, false, false, false, false],
-            [false, true, false, true, false, false, false, false],
+        const GOOD_IMG: &[[u8; 8]; 7] = &[
+            [
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+            ],
+            [
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+            ],
+            [
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+            ],
+            [
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+            ],
+            [
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+            ],
+            [
+                u8::MIN,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+            ],
+            [
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MAX,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+                u8::MIN,
+            ],
         ];
 
         #[test]
-        fn grayscale() -> Result<()> {
+        fn grayscale() {
             let img_path = Path::new("test_data/gray.png");
             let correct = ndarray::arr2(GOOD_IMG);
-            let loaded = load_image(img_path)?;
+            let loaded = load_image(img_path).unwrap();
             assert_eq!(correct, loaded);
-            Ok(())
         }
 
         #[test]
-        fn rgb() -> Result<()> {
+        fn rgb() {
             let img_path = Path::new("test_data/not_gray.png");
             let correct = ndarray::arr2(GOOD_IMG);
-            let loaded = load_image(img_path)?;
+            let loaded = load_image(img_path).unwrap();
             assert_eq!(correct, loaded);
-            Ok(())
         }
 
         #[test]
-        fn not_8_bit() -> Result<()> {
+        fn not_8_bit() {
             let img_path = Path::new("test_data/not_gray_16.png");
             let correct = ndarray::arr2(GOOD_IMG);
-            let loaded = load_image(img_path)?;
+            let loaded = load_image(img_path).unwrap();
             assert_eq!(correct, loaded);
-            Ok(())
         }
     }
 
     #[test]
-    fn test_get_diffs_from_sub_row() -> Result<()> {
+    fn test_get_diffs_from_sub_row() -> PyResult<()> {
         let sub_row = &[
-            &false, &false, &true, &false, &false, &true, &false, &true, &true, &true, &false,
-            &true,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MAX,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MAX,
         ];
         let good: [usize; 3] = [3, 2, 2];
-        let result = get_diffs_from_sub_row(sub_row)?;
+        let result = pixel_deltas_from_masked_run(sub_row);
         assert_eq!(result, good);
 
         Ok(())
     }
 
     #[test]
-    fn test_get_diffs_from_row() -> Result<()> {
+    fn test_get_diffs_from_row() {
         let row = vec![
-            &true, &false, &false, &true, &true, &true, &false, &true, &false, &true, &true, &false,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MAX,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MAX,
+            &u8::MIN,
         ];
         let row_mask = vec![
-            &false, &false, &false, &false, &true, &false, &false, &false, &true, &false, &false,
-            &true,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
+            &u8::MIN,
+            &u8::MIN,
+            &u8::MAX,
         ];
         let good: [usize; 2] = [3, 2];
-        let result = get_diffs_from_row(row, row_mask)?;
+        let result = pixel_deltas_from_row(row, row_mask);
         assert_eq!(result, good);
-
-        Ok(())
     }
 
     mod test_get_all_diffs {
         use super::super::*;
 
         #[test]
-        fn test_good_value_with_mask() -> Result<()> {
+        fn test_good_value_with_mask() {
             let img_height = 3;
             let img_width = 8;
             let image = Vec::from([
-                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
-                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
-                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+                [
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                ], // gaps: 2, 3, 2
+                [
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                ], // gaps: 2, 3, 2
+                [
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                ], // gaps: 2, 3, 2
             ])
             .concat();
-            let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
+            let image = Array2::<u8>::from_shape_vec((img_height, img_width), image).unwrap();
             let mask = Vec::from([
-                [false, false, false, false, false, false, false, false], // keep gaps
-                [false, true, false, false, false, false, false, true], // new gaps: 3 only (2s masked)
-                [false, true, true, true, true, false, false, false],   // new gaps: 1
+                [
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                ], // keep gaps
+                [
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                ], // new gaps: 3 only (2s masked)
+                [
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MAX,
+                    u8::MAX,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                ], // new gaps: 1
             ])
             .concat();
-            let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
+            let mask = Array2::<u8>::from_shape_vec((img_height, img_width), mask).unwrap();
             let good = [2, 3, 2, 3, 2];
-            let result = get_all_diffs(image, mask)?;
+            let result = all_pixel_deltas(image, mask).unwrap();
             assert_eq!(result, good);
-
-            Ok(())
         }
 
         #[test]
-        fn test_good_value_without_mask() -> Result<()> {
+        fn test_good_value_without_mask() {
             let img_height = 3;
             let img_width = 8;
             let image = Vec::from([
-                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
-                [true, false, true, false, false, true, false, true], // gaps: 2, 3, 2
+                [
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                ], // gaps: 2, 3, 2
+                [
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MAX,
+                ], // gaps: 2, 3, 2
                 // this row will indicate if the diff-from-left-side-of-image bug pope back up
-                [false, false, true, false, false, true, false, false], // gaps: 3
+                [
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MAX,
+                    u8::MIN,
+                    u8::MIN,
+                ], // gaps: 3
             ])
             .concat();
-            let image = Array2::<bool>::from_shape_vec((img_height, img_width), image)?;
+            let image = Array2::<u8>::from_shape_vec((img_height, img_width), image).unwrap();
             let mask = Vec::from([
-                [false, false, false, false, false, false, false, false], // keep gaps
-                [false, false, false, false, false, false, false, false], // new gaps: 3 only (2s masked)
-                [false, false, false, false, false, false, false, false], // keep gaps
+                [
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                ], // keep gaps
+                [
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                ], // new gaps: 3 only (2s masked)
+                [
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                    u8::MIN,
+                ], // keep gaps
             ])
             .concat();
-            let mask = Array2::<bool>::from_shape_vec((img_height, img_width), mask)?;
+            let mask = Array2::<u8>::from_shape_vec((img_height, img_width), mask).unwrap();
             let good = [2, 3, 2, 2, 3, 2, 3];
-            let result = get_all_diffs(image, mask)?;
+            let result = all_pixel_deltas(image, mask).unwrap();
             assert_eq!(result, good);
-
-            Ok(())
         }
 
         #[test]
         fn test_shape_mismatch() {
-            let image = Array2::zeros((1, 4)).mapv(|a: i8| a != 0);
-            let mask = Array2::zeros((4, 59)).mapv(|a: i8| a != 0);
-            let result = get_all_diffs(image, mask);
+            let image = Array2::<u8>::zeros((1, 4));
+            let mask = Array2::<u8>::zeros((4, 59));
+            let result = all_pixel_deltas(image, mask);
             assert!(result.is_err());
             assert!(result
                 .err()
