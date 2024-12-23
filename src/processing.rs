@@ -81,28 +81,35 @@ fn all_pixel_deltas<T: Bounded + PartialEq>(
     }
 
     let axis = Axis(0);
-    let mut diffs = Vec::new();
     let img_height = image.shape()[0] as isize;
+    let img_width = image.shape()[1];
+
+    let mut diffs = Vec::new();
+    let mut indices = Slice::new(0, None, 1);
+    let mut row_img = Vec::with_capacity(img_width);
+    let mut row_mask = Vec::with_capacity(img_width);
     for row in 0..img_height {
-        // take the whole row
-        let indices = Slice::new(row, Some(row + 1), 1);
-        let row_img = image
+        indices.start = row;
+        indices.end = Some(row + 1);
+        row_img.clear();
+        row_mask.clear();
+        image
             .slice_axis(axis, indices)
             .into_iter()
-            .collect::<Vec<&T>>();
-        let row_mask = mask
-            .slice_axis(axis, indices)
+            .for_each(|pixel| row_img.push(pixel));
+        mask.slice_axis(axis, indices)
             .into_iter()
-            .collect::<Vec<&T>>();
-        let mut row_diffs = pixel_deltas_from_row(row_img, row_mask);
-        diffs.append(&mut row_diffs);
+            .for_each(|pixel| row_mask.push(pixel));
+        pixel_deltas_from_row(&row_img, &row_mask)
+            .iter()
+            .for_each(|&delta| diffs.push(delta));
     }
 
     Ok(diffs)
 }
 
 /// Get all pixel distances between cell boundaries for a single row in an image
-fn pixel_deltas_from_row<T: Bounded + PartialEq>(row: Vec<&T>, row_mask: Vec<&T>) -> Vec<usize> {
+fn pixel_deltas_from_row<T: Bounded + PartialEq>(row: &Vec<&T>, row_mask: &Vec<&T>) -> Vec<usize> {
     let white = T::max_value();
 
     // find indices to split row into sub-rows
@@ -114,12 +121,16 @@ fn pixel_deltas_from_row<T: Bounded + PartialEq>(row: Vec<&T>, row_mask: Vec<&T>
     // identify and measure sub-rows
     let mut idx_start = 0;
     let mut row_diffs: Vec<usize> = Vec::new();
+    let mut split: &[&T];
     for idx_end in mask_split_indices {
         // avoid negative usize overflow panic and skip adjacent pixels
         if (idx_end == 0) || !(*row_mask[idx_end - 1] == white) {
-            let split = &row.as_slice()[idx_start..idx_end];
-            let mut sub_diffs = pixel_deltas_from_masked_run(split);
-            row_diffs.append(&mut sub_diffs);
+            split = &row.as_slice()[idx_start..idx_end];
+            pixel_deltas_from_masked_run(split)
+                .iter()
+                .for_each(|&delta| {
+                    row_diffs.push(delta);
+                });
         }
         // increment regardless of whether the current pixel was usable so we don't
         // accidentally keep masked pixels in the event of adjacent mask indices
@@ -335,7 +346,7 @@ mod tests {
             &u8::MAX,
         ];
         let good: [usize; 2] = [3, 2];
-        let result = pixel_deltas_from_row(row, row_mask);
+        let result = pixel_deltas_from_row(&row, &row_mask);
         assert_eq!(result, good);
     }
 
@@ -444,7 +455,7 @@ mod tests {
                     u8::MIN,
                     u8::MAX,
                 ], // gaps: 2, 3, 2
-                // this row will indicate if the diff-from-left-side-of-image bug pope back up
+                // this row will indicate if the diff-from-left-side-of-image bug pops back up
                 [
                     u8::MIN,
                     u8::MIN,
